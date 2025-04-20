@@ -34,9 +34,7 @@ DATA_DIR              = "Data" # Directory containing all data files
 SYMPTOM_ONTOLOGY_PATH = os.path.join(DATA_DIR, "symptom_ontology.json")
 COPING_SKILLS_PATH    = os.path.join(DATA_DIR, "coping_skills.json")
 HOTLINE_PATH          = os.path.join(DATA_DIR, "Hotline_Warmline_Data.csv")
-SCHIZO_PATH           = os.path.join(DATA_DIR, "schizophrenia spectrum and other psychotic disorders.json")
-DEPRESS_PATH          = os.path.join(DATA_DIR, "depressive disorders.json")
-BIPOLAR_PATH          = os.path.join(DATA_DIR, "bipolar and related disorders.json")
+FINAL_DSM5_PATH       = os.path.join(DATA_DIR, "final_DSM-5_data.json")  # New: Combined DSM-5 data file
 GLOSSARY_PATH         = os.path.join(DATA_DIR, "glossary of technical terms.json")
 
 # -------------------------------
@@ -78,9 +76,7 @@ def detect_crisis(text):
 # -------------------------------
 symptom_ontology  = load_json(SYMPTOM_ONTOLOGY_PATH) # Maps symptoms to tags
 coping_skills     = load_json(COPING_SKILLS_PATH)    # List of coping skills with descriptions and tags
-schizo_data       = load_json(SCHIZO_PATH)           # Glossary specific to schizophrenia spectrum disorders
-depressive_data   = load_json(DEPRESS_PATH)          # Glossary specific to depressive disorders
-bipolar_data      = load_json(BIPOLAR_PATH)          # Glossary specific to bipolar and related disorders
+final_dsm5_data   = load_json(FINAL_DSM5_PATH)       # Use combined DSM-5 data file
 glossary          = load_json(GLOSSARY_PATH)         # General glossary of technical terms
 hotline_df        = load_hotline(HOTLINE_PATH)       # DataFrame containing hotline and warmline information
 
@@ -125,12 +121,10 @@ else:
             st.markdown(prompt)
 
         # 2. Perform local analysis based on user input.
-        # Combine keys from all disorder glossaries and the symptom ontology into one master list for matching.
+        # Rebuild the symptom list using only symptom_ontology and final_dsm5_data.
         SYMPTOM_LIST = list(
             set(symptom_ontology.keys()) |
-            set(schizo_data.keys()) |
-            set(depressive_data.keys()) |
-            set(bipolar_data.keys())
+            set(final_dsm5_data.keys())
         )
         # Format the general glossary for inclusion in the GPT prompt.
         glossary_str = "\n".join(f"- {k}: {v}" for k, v in list(glossary.items()))
@@ -166,10 +160,9 @@ else:
 
         # Get definitions for the specific symptoms detected in the user's input.
         explanatory_defs = "\n".join([
-            f"- {sym}: {schizo_data.get(sym) or depressive_data.get(sym) or bipolar_data.get(sym)}"
+            f"- {sym}: {final_dsm5_data.get(sym)}"
             for sym in symptoms
-            # Only include definitions if found in one of the disorder glossaries.
-            if schizo_data.get(sym) or depressive_data.get(sym) or bipolar_data.get(sym)
+            if final_dsm5_data.get(sym)
         ])
 
         # User prompt combines the user's message with the results of the local analysis.
