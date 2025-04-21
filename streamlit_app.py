@@ -2,7 +2,8 @@ import streamlit as st
 import json            
 import pandas as pd    
 from openai import OpenAI
-import os             
+import os     
+import textwrap        
 
 # -------------------------------
 # Cache data loading functions
@@ -80,14 +81,18 @@ final_dsm5_data   = load_json(FINAL_DSM5_PATH)       # Use combined DSM-5 data f
 glossary          = load_json(GLOSSARY_PATH)         # General glossary of technical terms
 hotline_df        = load_hotline(HOTLINE_PATH)       # DataFrame containing hotline and warmline information
 
+# Pre-build: symptom list and glossary string
+SYMPTOM_LIST = list(set(symptom_ontology.keys()) | set(final_dsm5_data.keys()))
+glossary_str = "\n".join(f"- {k}: {v}" for k, v in glossary.items())
+
 # -------------------------------
 # Streamlit UI Setup
 # Configures the web application's appearance and initial state.
 # -------------------------------
 st.title("💬 Chat to Cope") # Sets the main title of the app
 st.write( # Displays introductory text to the user
-    "You can input your current troubles or feelings, "
-    "and we will identify possible symptoms for you and recommend suitable coping strategies and resources."
+    "You can enter your current concerns or feelings, "
+    "we will identify potential symptoms and recommend appropriate coping strategies and resources."
 )
 
 # Manage OpenAI API Key using Streamlit's session state to persist it across interactions.
@@ -96,7 +101,7 @@ if "api_key" not in st.session_state:
 
 # Only ask for the API key if it hasn't been provided yet.
 if not st.session_state.api_key:
-    openai_api_key = st.text_input("🔐 Enter your OpenAI API Key", type="password") # Password input for security
+    openai_api_key = st.text_input("🔐 Please enter your OpenAI API key", type="password") # Password input box for secure input
     if openai_api_key:
         st.session_state.api_key = openai_api_key # Store the key in session state
         st.rerun()  # Rerun the script to update the UI (hide input box, enable chat)
@@ -114,49 +119,45 @@ else:
             st.markdown(msg["content"]) # Render message content (supports Markdown)
 
     # Handle new user input via the chat input box at the bottom.
-    if prompt := st.chat_input("What is up?"):
+    if prompt := st.chat_input("What would you like to say?"):
         # 1. Save and display the user's new message.
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
         # 2. Perform local analysis based on user input.
-        # Rebuild the symptom list using only symptom_ontology and final_dsm5_data.
-        SYMPTOM_LIST = list(
-            set(symptom_ontology.keys()) |
-            set(final_dsm5_data.keys())
-        )
-        # Format the general glossary for inclusion in the GPT prompt.
-        glossary_str = "\n".join(f"- {k}: {v}" for k, v in list(glossary.items()))
-        # Extract potential symptoms mentioned by the user.
         symptoms          = extract_symptoms(prompt, SYMPTOM_LIST)
-        # Get associated tags for the extracted symptoms.
         tags              = get_symptom_tags(symptoms, symptom_ontology)
-        # Find coping skills relevant to the identified tags.
         recommended_skills = match_skills(tags, coping_skills)
 
-        # 3. Select appropriate resource type (Hotline vs. Warmline).
-        if detect_crisis(prompt):
-            # If crisis keywords are detected, filter for hotlines.
-            df = hotline_df[hotline_df["type"] == "hotline"]
-        else:
-            # Otherwise, filter for warmlines (less urgent support).
-            df = hotline_df[hotline_df["type"] == "warmline"]
+        # 3. Select appropriate resource type (Hotline vs. Warmline), only call detect_crisis once
+        # crisis = detect_crisis(prompt)
+        # resource_type = "hotline" if crisis else "warmline"
+        # df = hotline_df[hotline_df["type"] == resource_type]
 
-        # 4. Construct the prompts for the OpenAI API call.
-        # System prompt defines the AI's role, personality, and provides general context (glossary).
-        system_prompt = (
-            "You are a compassionate mental health assistant. "
-            "Here are definitions of technical terms you might use:\n"
-             f"{glossary_str}\n\n"
-            "Given the user's emotional concerns and any identified symptoms, "
-            "explain the issues in gentle language, then introduce 2–3 coping strategies clearly, "
-            "and end with an encouraging, warm tone."
-        )
+        # 4. Construct GPT system prompt
+        system_prompt = textwrap.dedent(f"""
+            You are a compassionate mental health assistant.
+            Here are the definitions of technical terms you might use:
+            {glossary_str}
+
+            Guidelines:
+            1) Respond in a warm tone, using 2-3 DSM-5 terms to describe coping strategies.
+            2) Determine resource_type:
+               - If there is self-harm or suicide risk, choose "hotline"
+               - If there are significant symptoms but no self-harm risk, choose "warmline"
+               - Otherwise, choose "none"
+            Please **only** return a JSON object in the following format:
+            {{
+              "reply": "...your reply...",
+              "resource_type": "hotline|warmline|none"
+            }}
+            User says: "{prompt}"
+            """)
         # Format the recommended skills for the prompt. Limit to top 3.
         skills_text = "\n".join(
             f"- {s['skill']}: {s['description']}" for s in recommended_skills[:3]
-        ) or "No specific skills matched." # Provide fallback text if no skills match.
+        ) or "No specific coping skills matched." # Provide fallback text if no skills match.
 
         # Get definitions for the specific symptoms detected in the user's input.
         explanatory_defs = "\n".join([
@@ -167,7 +168,7 @@ else:
 
         # User prompt combines the user's message with the results of the local analysis.
         user_prompt = f"""
-        The user said: "{prompt}"
+        User says: "{prompt}"
 
         Detected symptoms: {', '.join(symptoms) if symptoms else 'None'}
 
@@ -183,29 +184,43 @@ else:
             {"role": "user",   "content": user_prompt},
         ]
 
-        # 5. Call the OpenAI API to generate the assistant's response.
-        completion = client.chat.completions.create(
-            model="gpt-4.1", # Specify the GPT model to use
-            messages=messages # Pass the constructed messages
-        )
-        # Extract the text content from the API response.
-        gpt_response = completion.choices[0].message.content.strip()
-
-        # 6. Append resource information if needed.
-        # Add hotline/warmline info if crisis detected OR if specific symptoms were locally identified.
-        if detect_crisis(prompt) or symptoms:
-            # Select the first available resource from the filtered DataFrame.
-            resource = df.iloc[0].to_dict() if not df.empty else {"name": "No resource available", "phone number": ""}
-            # Combine the GPT response with the resource information.
-            full_response = (
-                gpt_response
-                + f"\n\n### 📞 Suggested Resource:\n{resource['name']} – {resource['phone number']}"
+        # 5. Call OpenAI and get the raw response
+        with st.spinner("Generating response, please wait..."):
+            completion = client.chat.completions.create(
+                model="gpt-4.1",
+                messages=messages
             )
-        else:
-            # If no crisis or specific symptoms, just use the GPT response.
-            full_response = gpt_response
+        raw = completion.choices[0].message.content.strip()
+        # 6. Parse JSON output
+        try:
+            result = json.loads(raw)
+            reply = result.get("reply", raw)
+            resource_type = result.get("resource_type", "none")
+        except json.JSONDecodeError:
+            # If not valid JSON, use raw as reply and recommend no resources
+            reply = raw
+            resource_type = "none"
+        
+        # 6.5 Fallback: If the LLM does not recommend any resources but there are symptoms/skills in the local analysis, then use warmline
+        if resource_type == "none" and symptoms:
+            resource_type = "warmline"
 
-        # 7. Display the assistant's final response and save it to chat history.
+        # 7. Based on resource_type, fetch resources from hotline_df and append to full_response
+        full_response = reply
+
+        if resource_type in ("hotline", "warmline"):
+            # Filter DataFrame by resource_type
+            df_res = hotline_df[hotline_df["type"] == resource_type]
+            if not df_res.empty:
+                row = df_res.iloc[0]
+                name = row.get("name", "No resource available")
+                phone = row.get("phone number", "")
+                full_response += f"\n\n📞 Recommended resource:\n{name} – {phone}"
+            # If df_res is empty, add nothing
+
+        # resource_type == "none" keeps full_response as reply itself
+
+        # 8. Display and store
         with st.chat_message("assistant"):
-            st.markdown(full_response) # Display the response in the chat interface
-        st.session_state.messages.append({"role": "assistant", "content": full_response}) # Add to history
+            st.markdown(full_response)
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
