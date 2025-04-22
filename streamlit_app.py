@@ -65,10 +65,8 @@ def match_skills(tags, skill_list):
     return matches
 
 def detect_crisis(text):
-    # Checks if the input 'text' contains any predefined crisis keywords.
-    # Used to determine if emergency resources (hotlines) should be prioritized.
+    """Legacy function, kept for backward compatibility"""
     crisis_keywords = ["suicide", "kill myself", "hurt myself", "ending my life"]
-    # Returns True if any keyword is found (case-insensitive), False otherwise.
     return any(word in text.lower() for word in crisis_keywords)
 
 # -------------------------------
@@ -99,6 +97,10 @@ st.write( # Displays introductory text to the user
 if "api_key" not in st.session_state:
     st.session_state.api_key = "" # Initialize if not already set
 
+# Add a session state variable to track if we offered a resource
+if "resource_offered" not in st.session_state:
+    st.session_state.resource_offered = None
+
 # Only ask for the API key if it hasn't been provided yet.
 if not st.session_state.api_key:
     openai_api_key = st.text_input("🔐 Please enter your OpenAI API key", type="password") # Password input box for secure input
@@ -124,18 +126,90 @@ else:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
+        
+        # Check if this is a response to a previous resource offer
+        resource_requested = False
+        if st.session_state.resource_offered and prompt.lower() in ["yes", "yeah", "sure", "okay", "ok"]:
+            # User confirmed they want the resource
+            resource_requested = True
+            resource_type = st.session_state.resource_offered
+        
+        else:
+            # Modified: Skip local crisis detection and delegate the assessment to the LLM
+            # First extract symptoms for skill recommendation
+            symptoms = extract_symptoms(prompt, SYMPTOM_LIST)
+            tags = get_symptom_tags(symptoms, symptom_ontology)
+            recommended_skills = match_skills(tags, coping_skills)
+            
+            # Initial resource type is none - let LLM decide later
+            resource_type = "none"
+        
+        # 4. Use a preliminary system prompt to evaluate crisis level
+        preliminary_system_prompt = textwrap.dedent(f"""
+            You are a mental health professional who evaluates the severity of crisis situations.
+            You need to analyze the following user message and determine if it represents:
+            1) A crisis situation (suicidal ideation, self-harm, immediate danger) - respond with "hotline"
+            2) Significant mental health symptoms but no immediate danger - respond with "warmline" 
+            3) General concerns with no acute symptoms - respond with "none"
+            
+            ONLY respond with one word: "hotline", "warmline", or "none".
+            Err on the side of caution - if there's any hint of suicidal thoughts or self-harm, choose "hotline".
+            """)
+            
+        preliminary_messages = [
+            {"role": "system", "content": preliminary_system_prompt},
+            {"role": "user", "content": f"Analyze this message for crisis indicators: \"{prompt}\""}
+        ]
+            
+        # First call to determine resource type
+        with st.spinner("Analyzing message..."):
+            preliminary_completion = client.chat.completions.create(
+                model="gpt-4.1",
+                messages=preliminary_messages,
+                max_tokens=10  # Short response to save tokens
+            )
+        
+        llm_resource_type = preliminary_completion.choices[0].message.content.strip().lower()
+        
+        # Validate the response and update resource_type if valid
+        if llm_resource_type in ["hotline", "warmline", "none"]:
+            resource_type = llm_resource_type
+        
+        # Now proceed with getting resource information if needed
+        resource_info = {}
+        if resource_type in ("hotline", "warmline"):
+            df_res = hotline_df[hotline_df["type"] == resource_type]
+            if not df_res.empty:
+                row = df_res.iloc[0]
+                resource_info = {
+                    "name": row.get("name", ""),
+                    "phone": row.get("phone number", ""),
+                    "description": row.get("description", "") if "description" in row else ""
+                }
+            
+                # Track that we offered this resource
+                st.session_state.resource_offered = resource_type
+                
+                # If this was a direct request for the resource, make sure to include it
+                if resource_requested:
+                    resource_instruction = f"""
+                    3) CRITICAL: The user has confirmed they want the resource information.
+                    You MUST provide the following resource information clearly in your reply:
+                    Resource name: {resource_info["name"]}
+                    Phone number: {resource_info["phone"]}
+                    {f'Description: {resource_info["description"]}' if resource_info.get("description") else ''}
+                    """
+                else:
+                    # Regular resource offering
+                    resource_instruction = f"""
+                    3) IMPORTANT: You MUST incorporate the following resource information into your reply:
+                    Resource name: {resource_info["name"]}
+                    Phone number: {resource_info["phone"]}
+                    {f'Description: {resource_info["description"]}' if resource_info.get("description") else ''}
+                    
+                    Include the phone number in your response. Format it naturally but ensure it appears clearly.
+                    """
 
-        # 2. Perform local analysis based on user input.
-        symptoms          = extract_symptoms(prompt, SYMPTOM_LIST)
-        tags              = get_symptom_tags(symptoms, symptom_ontology)
-        recommended_skills = match_skills(tags, coping_skills)
-
-        # 3. Select appropriate resource type (Hotline vs. Warmline), only call detect_crisis once
-        # crisis = detect_crisis(prompt)
-        # resource_type = "hotline" if crisis else "warmline"
-        # df = hotline_df[hotline_df["type"] == resource_type]
-
-        # 4. Construct GPT system prompt
         system_prompt = textwrap.dedent(f"""
             You are a compassionate mental health assistant.
             Here are the definitions of technical terms you might use:
@@ -143,30 +217,33 @@ else:
 
             Guidelines:
             1) Respond in a warm tone, using 2-3 DSM-5 terms to describe coping strategies.
-            2) Determine resource_type:
+            2) Format your response with proper paragraphs - use a new paragraph for each distinct point or idea.
+            3) Keep paragraphs short and readable (3-5 sentences maximum per paragraph).
+            4) Determine resource_type:
                - If there is self-harm or suicide risk, choose "hotline"
                - If there are significant symptoms but no self-harm risk, choose "warmline"
                - Otherwise, choose "none"
+            {resource_instruction if resource_info else ""}
+            
             Please **only** return a JSON object in the following format:
             {{
-              "reply": "...your reply...",
+              "reply": "...your well-formatted reply with proper paragraph breaks (include the resource information naturally if provided)...",
               "resource_type": "hotline|warmline|none"
             }}
-            User says: "{prompt}"
             """)
-        # Format the recommended skills for the prompt. Limit to top 3.
+
+        # Format skill recommendations and symptom definitions
         skills_text = "\n".join(
             f"- {s['skill']}: {s['description']}" for s in recommended_skills[:3]
-        ) or "No specific coping skills matched." # Provide fallback text if no skills match.
+        ) or "No specific coping skills matched."
 
-        # Get definitions for the specific symptoms detected in the user's input.
         explanatory_defs = "\n".join([
             f"- {sym}: {final_dsm5_data.get(sym)}"
             for sym in symptoms
             if final_dsm5_data.get(sym)
         ])
 
-        # User prompt combines the user's message with the results of the local analysis.
+        # User prompt
         user_prompt = f"""
         User says: "{prompt}"
 
@@ -178,49 +255,32 @@ else:
         Recommended coping skills:
         {skills_text}
         """
-        # Structure the messages for the OpenAI API (system role + user role).
+        
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ]
 
-        # 5. Call OpenAI and get the raw response
+        # 5. Call OpenAI to get a response
         with st.spinner("Generating response, please wait..."):
             completion = client.chat.completions.create(
                 model="gpt-4.1",
                 messages=messages
             )
         raw = completion.choices[0].message.content.strip()
+        
         # 6. Parse JSON output
         try:
             result = json.loads(raw)
-            reply = result.get("reply", raw)
+            full_response = result.get("reply", raw)  # Use the complete reply generated by the LLM (including resource information)
             resource_type = result.get("resource_type", "none")
         except json.JSONDecodeError:
-            # If not valid JSON, use raw as reply and recommend no resources
-            reply = raw
+            full_response = raw
             resource_type = "none"
         
-        # 6.5 Fallback: If the LLM does not recommend any resources but there are symptoms/skills in the local analysis, then use warmline
-        if resource_type == "none" and symptoms:
-            resource_type = "warmline"
-
-        # 7. Based on resource_type, fetch resources from hotline_df and append to full_response
-        full_response = reply
-
-        if resource_type in ("hotline", "warmline"):
-            # Filter DataFrame by resource_type
-            df_res = hotline_df[hotline_df["type"] == resource_type]
-            if not df_res.empty:
-                row = df_res.iloc[0]
-                name = row.get("name", "No resource available")
-                phone = row.get("phone number", "")
-                full_response += f"\n\n📞 Recommended resource:\n{name} – {phone}"
-            # If df_res is empty, add nothing
-
-        # resource_type == "none" keeps full_response as reply itself
-
-        # 8. Display and store
+        # No longer need to manually append resource information, as the LLM has incorporated it into the reply
+        
+        # 7. Display and store
         with st.chat_message("assistant"):
             st.markdown(full_response)
         st.session_state.messages.append({"role": "assistant", "content": full_response})
