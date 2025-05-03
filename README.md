@@ -33,10 +33,10 @@ Built with **Streamlit**, powered by **OpenAI GPT-4.1**, and enriched by structu
 
 ---
 
-## 🚀 Getting Started
+### How to run it on your own machine
 
-### 1. Clone the repository
+1. Install the requirements
+   $ pip install -r requirements.txt
 
-```bash
-git clone https://github.com/your-username/chat-to-cope.git
-cd chat-to-cope
+3. Run the app
+   $ streamlit run streamlit_app.py
